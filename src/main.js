@@ -372,6 +372,14 @@ ipcMain.handle('pet:select', (_event, petId) => {
   return pet;
 });
 
+ipcMain.on('window:set-mouse-passthrough', (_event, passthrough) => {
+  if (!mainWindow || mainWindow.isDestroyed() || dragSession) {
+    return;
+  }
+
+  mainWindow.setIgnoreMouseEvents(Boolean(passthrough), { forward: true });
+});
+
 ipcMain.on('window:drag-start', (_event, point) => {
   if (!mainWindow) {
     return;
@@ -383,6 +391,7 @@ ipcMain.on('window:drag-start', (_event, point) => {
     startWindowX: windowX,
     startWindowY: windowY
   };
+  mainWindow.setIgnoreMouseEvents(false);
 });
 
 ipcMain.on('window:drag-move', (_event, point) => {

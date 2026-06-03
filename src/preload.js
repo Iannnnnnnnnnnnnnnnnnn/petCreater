@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld('petApi', {
   selectPet: (petId) => ipcRenderer.invoke('pet:select', petId),
   getScale: () => ipcRenderer.invoke('view:get-scale'),
   showContextMenu: () => ipcRenderer.invoke('pet:show-menu'),
+  setMousePassthrough: (passthrough) => ipcRenderer.send('window:set-mouse-passthrough', passthrough),
   dragStart: (point) => ipcRenderer.send('window:drag-start', point),
   dragMove: (point) => ipcRenderer.send('window:drag-move', point),
   dragEnd: () => ipcRenderer.send('window:drag-end'),

@@ -23,11 +23,14 @@ let waitingLoopsRemaining = 0;
 let currentFpsOverride = null;
 let petScale = 1;
 let frameSequences = {};
+let frameBounds = {};
+let currentHitSquare = null;
+let isMousePassthrough = false;
 
 const DEFAULT_CANVAS_WIDTH = 192;
 const DEFAULT_CANVAS_HEIGHT = 208;
 const IDLE_SLOW_DELAY_MS = 8000;
-const FRAME_ALPHA_SAMPLE_STEP = 4;
+const FRAME_ALPHA_THRESHOLD = 8;
 
 function stateConfig(name) {
   return pet && pet.states && pet.states[name] ? pet.states[name] : null;
@@ -160,14 +163,14 @@ function hasAtlasFrames(image, nextPet) {
   return image.naturalWidth >= maxFrames * cellWidth && image.naturalHeight >= (maxRow + 1) * cellHeight;
 }
 
-function isFrameVisible(image, sourceX, sourceY, cellWidth, cellHeight) {
+function getFrameBounds(image, sourceX, sourceY, cellWidth, cellHeight) {
   if (
     sourceX < 0 ||
     sourceY < 0 ||
     sourceX + cellWidth > image.naturalWidth ||
     sourceY + cellHeight > image.naturalHeight
   ) {
-    return false;
+    return null;
   }
 
   const sampleCanvas = document.createElement('canvas');
@@ -176,18 +179,40 @@ function isFrameVisible(image, sourceX, sourceY, cellWidth, cellHeight) {
   const sampleContext = sampleCanvas.getContext('2d');
   sampleContext.drawImage(image, sourceX, sourceY, cellWidth, cellHeight, 0, 0, cellWidth, cellHeight);
   const pixels = sampleContext.getImageData(0, 0, cellWidth, cellHeight).data;
+  let minX = cellWidth;
+  let minY = cellHeight;
+  let maxX = -1;
+  let maxY = -1;
 
-  for (let i = 3; i < pixels.length; i += 4 * FRAME_ALPHA_SAMPLE_STEP) {
-    if (pixels[i] > 8) {
-      return true;
+  for (let y = 0; y < cellHeight; y += 1) {
+    for (let x = 0; x < cellWidth; x += 1) {
+      const alpha = pixels[((y * cellWidth + x) * 4) + 3];
+      if (alpha <= FRAME_ALPHA_THRESHOLD) {
+        continue;
+      }
+
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
     }
   }
 
-  return false;
+  if (maxX < minX || maxY < minY) {
+    return null;
+  }
+
+  return {
+    x: minX,
+    y: minY,
+    width: maxX - minX + 1,
+    height: maxY - minY + 1
+  };
 }
 
-function buildFrameSequences(image, nextPet) {
+function buildFrameMetadata(image, nextPet) {
   const sequences = {};
+  const bounds = {};
   const cellWidth = Number(nextPet.cellWidth || DEFAULT_CANVAS_WIDTH);
   const cellHeight = Number(nextPet.cellHeight || DEFAULT_CANVAS_HEIGHT);
 
@@ -196,6 +221,7 @@ function buildFrameSequences(image, nextPet) {
     const row = Number(state.row || 0);
     const visibleFrames = [];
     const validFrames = [];
+    bounds[stateName] = {};
 
     for (let frame = 0; frame < configuredFrameCount; frame += 1) {
       const sourceX = frame * cellWidth;
@@ -203,15 +229,17 @@ function buildFrameSequences(image, nextPet) {
       if (sourceX + cellWidth <= image.naturalWidth && sourceY + cellHeight <= image.naturalHeight) {
         validFrames.push(frame);
       }
-      if (isFrameVisible(image, sourceX, sourceY, cellWidth, cellHeight)) {
+      const frameBound = getFrameBounds(image, sourceX, sourceY, cellWidth, cellHeight);
+      if (frameBound) {
         visibleFrames.push(frame);
+        bounds[stateName][frame] = frameBound;
       }
     }
 
     sequences[stateName] = visibleFrames.length ? visibleFrames : validFrames;
   }
 
-  return sequences;
+  return { sequences, bounds };
 }
 
 function getFrameSequence(stateName, state) {
@@ -227,6 +255,80 @@ function getEffectiveFrameCount(stateName, state) {
   return Math.max(1, getFrameSequence(stateName, state).length);
 }
 
+function getHitSquareForFrame(stateName, frame, fallbackWidth, fallbackHeight) {
+  const bounds = frameBounds[stateName] && frameBounds[stateName][frame]
+    ? frameBounds[stateName][frame]
+    : { x: 0, y: 0, width: fallbackWidth, height: fallbackHeight };
+  const side = Math.max(bounds.width, bounds.height);
+  const centerX = bounds.x + bounds.width / 2;
+  const centerY = bounds.y + bounds.height / 2;
+  const x = Math.max(0, centerX - side / 2);
+  const y = Math.max(0, centerY - side / 2);
+
+  return {
+    x,
+    y,
+    width: side,
+    height: side
+  };
+}
+
+function pointInCurrentHitSquare(clientX, clientY) {
+  if (!currentHitSquare || canvas.hidden) {
+    return false;
+  }
+
+  const canvasRect = canvas.getBoundingClientRect();
+  const scaleX = canvasRect.width / canvas.width;
+  const scaleY = canvasRect.height / canvas.height;
+  const hitX = canvasRect.left + currentHitSquare.x * scaleX;
+  const hitY = canvasRect.top + currentHitSquare.y * scaleY;
+  const hitWidth = currentHitSquare.width * scaleX;
+  const hitHeight = currentHitSquare.height * scaleY;
+
+  return (
+    clientX >= hitX &&
+    clientX <= hitX + hitWidth &&
+    clientY >= hitY &&
+    clientY <= hitY + hitHeight
+  );
+}
+
+function setMousePassthrough(passthrough) {
+  if (isMousePassthrough === passthrough) {
+    return;
+  }
+
+  isMousePassthrough = passthrough;
+  window.petApi.setMousePassthrough(passthrough);
+}
+
+function updateMousePassthrough(event) {
+  if (!pet || isDragging) {
+    setMousePassthrough(false);
+    return;
+  }
+
+  const isInsideHitSquare = pointInCurrentHitSquare(event.clientX, event.clientY);
+  setMousePassthrough(!isInsideHitSquare);
+
+  if (isInsideHitSquare && !isPointerInside) {
+    isPointerInside = true;
+    clearTimeout(hoverIdleTimer);
+    clearIdleSlowTimer();
+    waitForLeaveBeforeWaiting = true;
+    playInteraction('hover');
+  }
+
+  if (!isInsideHitSquare && isPointerInside) {
+    isPointerInside = false;
+    clearTimeout(hoverIdleTimer);
+    if (!isDragging) {
+      hoverIdleTimer = setTimeout(() => startWaitingWindDown(2), 180);
+    }
+  }
+}
+
 function renderFrame(now) {
   animationRequest = requestAnimationFrame(renderFrame);
   if (!pet || !spritesheet || !spritesheet.complete) {
@@ -237,6 +339,7 @@ function renderFrame(now) {
     const targetWidth = Math.min(Math.max(spritesheet.naturalWidth, 120), 260);
     const targetHeight = Math.min(Math.max(spritesheet.naturalHeight, 120), 300);
     resizeCanvas(targetWidth, targetHeight);
+    currentHitSquare = { x: 0, y: 0, width: targetWidth, height: targetHeight };
     drawImageContained(spritesheet, targetWidth, targetHeight);
     return;
   }
@@ -278,6 +381,7 @@ function renderFrame(now) {
   const sourceY = Number(activeState.row || 0) * cellHeight;
 
   resizeCanvas(cellWidth, cellHeight);
+  currentHitSquare = getHitSquareForFrame(currentStateName, sourceFrame, cellWidth, cellHeight);
   clearCanvas();
   context.drawImage(
     spritesheet,
@@ -305,6 +409,9 @@ async function setPet(nextPet) {
   pet = nextPet;
   spritesheet = null;
   frameSequences = {};
+  frameBounds = {};
+  currentHitSquare = null;
+  setMousePassthrough(false);
   renderMode = 'atlas';
   currentFrame = 0;
   lastFrameAt = 0;
@@ -325,7 +432,11 @@ async function setPet(nextPet) {
   try {
     spritesheet = await loadSpritesheet(pet);
     renderMode = hasAtlasFrames(spritesheet, pet) ? 'atlas' : 'single-image';
-    frameSequences = renderMode === 'atlas' ? buildFrameSequences(spritesheet, pet) : {};
+    if (renderMode === 'atlas') {
+      const metadata = buildFrameMetadata(spritesheet, pet);
+      frameSequences = metadata.sequences;
+      frameBounds = metadata.bounds;
+    }
     playState('idle', { restart: true });
     scheduleIdleSlow();
   } catch (error) {
@@ -336,7 +447,7 @@ async function setPet(nextPet) {
 }
 
 function handlePointerDown(event) {
-  if (!pet || event.button !== 0) {
+  if (!pet || event.button !== 0 || !pointInCurrentHitSquare(event.clientX, event.clientY)) {
     return;
   }
 
@@ -416,6 +527,10 @@ function handlePointerUp() {
 }
 
 function handleClick() {
+  if (!isPointerInside) {
+    return;
+  }
+
   if (suppressNextClick) {
     suppressNextClick = false;
     return;
@@ -430,6 +545,10 @@ function handleClick() {
 }
 
 function handleDoubleClick() {
+  if (!isPointerInside) {
+    return;
+  }
+
   clearTimeout(clickTimer);
   markInteraction();
   pulseClass('double-tap', 260);
@@ -438,11 +557,15 @@ function handleDoubleClick() {
 
 function handleContextMenu(event) {
   event.preventDefault();
+  if (!pointInCurrentHitSquare(event.clientX, event.clientY)) {
+    return;
+  }
+
   window.petApi.showContextMenu();
 }
 
 function handleWheel(event) {
-  if (!pet) {
+  if (!pet || !pointInCurrentHitSquare(event.clientX, event.clientY)) {
     return;
   }
 
@@ -461,24 +584,11 @@ function handleWheel(event) {
 async function boot() {
   canvas.addEventListener('pointerdown', handlePointerDown);
   window.addEventListener('pointermove', handlePointerMove);
+  window.addEventListener('mousemove', updateMousePassthrough);
   window.addEventListener('pointerup', handlePointerUp);
   window.addEventListener('pointercancel', handlePointerUp);
   canvas.addEventListener('click', handleClick);
   canvas.addEventListener('dblclick', handleDoubleClick);
-  canvas.addEventListener('mouseenter', () => {
-    isPointerInside = true;
-    clearTimeout(hoverIdleTimer);
-    clearIdleSlowTimer();
-    waitForLeaveBeforeWaiting = true;
-    playInteraction('hover');
-  });
-  canvas.addEventListener('mouseleave', () => {
-    isPointerInside = false;
-    clearTimeout(hoverIdleTimer);
-    if (!isDragging) {
-      hoverIdleTimer = setTimeout(() => startWaitingWindDown(2), 180);
-    }
-  });
   window.addEventListener('contextmenu', handleContextMenu);
   window.addEventListener('wheel', handleWheel, { passive: false });
 
