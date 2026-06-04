@@ -4,13 +4,17 @@ const path = require('path');
 const { pathToFileURL } = require('url');
 
 let mainWindow = null;
+let settingsWindow = null;
 let dragSession = null;
+let petCycleTimer = null;
 
 const BASE_WINDOW_WIDTH = 260;
 const BASE_WINDOW_HEIGHT = 310;
 const MIN_PET_SCALE = 0.7;
 const MAX_PET_SCALE = 1.8;
-const PET_SCALE_STEP = 0.1;
+const DEFAULT_CYCLE_INTERVAL_SECONDS = 60;
+const MIN_CYCLE_INTERVAL_SECONDS = 10;
+const MAX_CYCLE_INTERVAL_SECONDS = 86400;
 
 const DEFAULT_STATES = {
   idle: { row: 0, frames: 6, fps: 3, loop: true },
@@ -82,6 +86,18 @@ function saveSettings(settings) {
   writeJson(settingsPath(), settings);
 }
 
+function clampCycleIntervalSeconds(seconds) {
+  const numericSeconds = Number(seconds);
+  if (!Number.isFinite(numericSeconds)) {
+    return DEFAULT_CYCLE_INTERVAL_SECONDS;
+  }
+
+  return Math.min(
+    MAX_CYCLE_INTERVAL_SECONDS,
+    Math.max(MIN_CYCLE_INTERVAL_SECONDS, Math.round(numericSeconds))
+  );
+}
+
 function clampPetScale(scale) {
   const numericScale = Number(scale);
   if (!Number.isFinite(numericScale)) {
@@ -114,6 +130,43 @@ function setPetScale(scale) {
 
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('view:scale-changed', nextScale);
+  }
+}
+
+function getCycleSettings() {
+  const installedPetIds = new Set(listPets().map((pet) => pet.id));
+  const settings = readSettings();
+  const petIds = Array.isArray(settings.cyclePetIds)
+    ? settings.cyclePetIds.filter((petId) => installedPetIds.has(petId))
+    : [];
+
+  return {
+    enabled: Boolean(settings.cycleEnabled) && petIds.length >= 2,
+    petIds,
+    intervalSeconds: clampCycleIntervalSeconds(settings.cycleIntervalSeconds)
+  };
+}
+
+function getSettingsSnapshot() {
+  const cycle = getCycleSettings();
+  return {
+    petScale: getPetScale(),
+    cycleEnabled: cycle.enabled,
+    cyclePetIds: cycle.petIds,
+    cycleIntervalSeconds: cycle.intervalSeconds,
+    pets: listPets().map((pet) => ({
+      id: pet.id,
+      displayName: pet.displayName,
+      description: pet.description,
+      selected: cycle.petIds.includes(pet.id)
+    }))
+  };
+}
+
+function clearPetCycleTimer() {
+  if (petCycleTimer) {
+    clearInterval(petCycleTimer);
+    petCycleTimer = null;
   }
 }
 
@@ -201,6 +254,43 @@ function getActivePet() {
   return installedPets[0] || null;
 }
 
+function selectPet(petId, options = {}) {
+  const pet = readInstalledPet(petId);
+  if (!pet) {
+    return null;
+  }
+
+  saveSettings({ ...readSettings(), activePetId: pet.id });
+  broadcastPetChanged();
+  if (options.restartCycle !== false) {
+    restartPetCycle();
+  }
+  return pet;
+}
+
+function switchToNextCyclePet() {
+  const cycle = getCycleSettings();
+  if (!cycle.enabled) {
+    clearPetCycleTimer();
+    return;
+  }
+
+  const active = getActivePet();
+  const activeIndex = active ? cycle.petIds.indexOf(active.id) : -1;
+  const nextIndex = activeIndex >= 0 ? (activeIndex + 1) % cycle.petIds.length : 0;
+  selectPet(cycle.petIds[nextIndex], { restartCycle: false });
+}
+
+function restartPetCycle() {
+  clearPetCycleTimer();
+  const cycle = getCycleSettings();
+  if (!cycle.enabled) {
+    return;
+  }
+
+  petCycleTimer = setInterval(switchToNextCyclePet, cycle.intervalSeconds * 1000);
+}
+
 function validateSourcePetDir(sourceDir) {
   const manifestPath = path.join(sourceDir, 'pet.json');
   if (!fs.existsSync(manifestPath)) {
@@ -240,6 +330,7 @@ function installPet(sourceDir) {
 
   writeJson(path.join(targetDir, 'pet.json'), installedPet);
   saveSettings({ ...readSettings(), activePetId: petId });
+  restartPetCycle();
   return readInstalledPet(petId);
 }
 
@@ -279,8 +370,7 @@ function showPetMenu() {
       type: 'radio',
       checked: active && active.id === pet.id,
       click: () => {
-        saveSettings({ ...readSettings(), activePetId: pet.id });
-        broadcastPetChanged();
+        selectPet(pet.id);
       }
     }))
     : [{ label: '暂无已安装桌宠', enabled: false }];
@@ -291,21 +381,8 @@ function showPetMenu() {
     { label: '切换桌宠', submenu: petItems },
     { type: 'separator' },
     {
-      label: `大小：${Math.round(currentScale * 100)}%`,
-      submenu: [
-        {
-          label: '放大',
-          click: () => setPetScale(currentScale + PET_SCALE_STEP)
-        },
-        {
-          label: '缩小',
-          click: () => setPetScale(currentScale - PET_SCALE_STEP)
-        },
-        {
-          label: '重置大小',
-          click: () => setPetScale(1)
-        }
-      ]
+      label: `桌宠设置（${Math.round(currentScale * 100)}%）`,
+      click: openSettingsWindow
     },
     { type: 'separator' },
     {
@@ -330,6 +407,38 @@ function showPetMenu() {
   ]);
 
   menu.popup({ window: mainWindow });
+}
+
+function openSettingsWindow() {
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    settingsWindow.show();
+    settingsWindow.focus();
+    return;
+  }
+
+  settingsWindow = new BrowserWindow({
+    width: 460,
+    height: 620,
+    minWidth: 420,
+    minHeight: 540,
+    title: 'PetCreater 设置',
+    parent: mainWindow,
+    modal: false,
+    show: false,
+    autoHideMenuBar: true,
+    backgroundColor: '#f5f6f8',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+
+  settingsWindow.once('ready-to-show', () => settingsWindow.show());
+  settingsWindow.on('closed', () => {
+    settingsWindow = null;
+  });
+  settingsWindow.loadFile(path.join(__dirname, 'settings', 'index.html'));
 }
 
 function createWindow() {
@@ -362,14 +471,37 @@ ipcMain.handle('pet:list', () => listPets());
 ipcMain.handle('pet:install-dialog', () => chooseAndInstallPet());
 ipcMain.handle('pet:show-menu', () => showPetMenu());
 ipcMain.handle('view:get-scale', () => getPetScale());
-ipcMain.handle('pet:select', (_event, petId) => {
-  const pet = readInstalledPet(petId);
-  if (!pet) {
-    return null;
+ipcMain.handle('settings:get', () => getSettingsSnapshot());
+ipcMain.handle('settings:preview-scale', (_event, scale) => {
+  setPetScale(scale);
+  return getPetScale();
+});
+ipcMain.handle('settings:save', (_event, preferences) => {
+  const installedPetIds = new Set(listPets().map((pet) => pet.id));
+  const cyclePetIds = Array.isArray(preferences.cyclePetIds)
+    ? [...new Set(preferences.cyclePetIds)].filter((petId) => installedPetIds.has(petId))
+    : [];
+  const cycleEnabled = Boolean(preferences.cycleEnabled) && cyclePetIds.length >= 2;
+  const settings = readSettings();
+
+  saveSettings({
+    ...settings,
+    petScale: clampPetScale(preferences.petScale),
+    cycleEnabled,
+    cyclePetIds,
+    cycleIntervalSeconds: clampCycleIntervalSeconds(preferences.cycleIntervalSeconds)
+  });
+  setPetScale(preferences.petScale);
+  restartPetCycle();
+  return getSettingsSnapshot();
+});
+ipcMain.handle('settings:close', () => {
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    settingsWindow.close();
   }
-  saveSettings({ ...readSettings(), activePetId: pet.id });
-  broadcastPetChanged();
-  return pet;
+});
+ipcMain.handle('pet:select', (_event, petId) => {
+  return selectPet(petId);
 });
 
 ipcMain.on('window:set-mouse-passthrough', (_event, passthrough) => {
@@ -411,6 +543,7 @@ ipcMain.on('window:drag-end', () => {
 app.whenReady().then(() => {
   ensureDir(petsRoot());
   createWindow();
+  restartPetCycle();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

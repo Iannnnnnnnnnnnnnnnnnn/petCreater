@@ -1,6 +1,6 @@
 {
   "name": "pet-creater",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A standalone desktop pet app that installs local pet.json + spritesheet.webp assets.",
   "main": "src/main.js",
   "scripts": {
@@ -8,7 +8,7 @@
     "start": "electron .",
     "build": "electron-builder",
     "build:portable": "electron-builder --win portable",
-    "check": "node --check src/main.js && node --check src/preload.js && node --check src/renderer/renderer.js"
+    "check": "node --check src/main.js && node --check src/preload.js && node --check src/renderer/renderer.js && node --check src/settings/settings.js"
   },
   "author": "",
   "license": "MIT",
@@ -33,7 +33,8 @@
     },
     "nsis": {
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "include": "build/installer.nsh"
     }
   }
 }

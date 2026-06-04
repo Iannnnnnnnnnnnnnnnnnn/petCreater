@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PetCreater 设置</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="settings-page">
+      <header class="page-header">
+        <h1>桌宠设置</h1>
+        <span id="saveStatus" class="save-status" aria-live="polite"></span>
+      </header>
+
+      <section class="settings-section">
+        <div class="section-heading">
+          <label for="scaleRange">形象大小</label>
+          <output id="scaleValue" for="scaleRange">100%</output>
+        </div>
+        <input id="scaleRange" type="range" min="70" max="180" step="5" value="100">
+      </section>
+
+      <section class="settings-section">
+        <div class="section-heading">
+          <label for="cycleEnabled">循环形象</label>
+          <input id="cycleEnabled" class="toggle" type="checkbox">
+        </div>
+
+        <div class="interval-row">
+          <label for="intervalValue">切换间隔</label>
+          <div class="interval-control">
+            <input id="intervalValue" type="number" min="1" step="1" value="1">
+            <select id="intervalUnit">
+              <option value="seconds">秒</option>
+              <option value="minutes" selected>分钟</option>
+              <option value="hours">小时</option>
+            </select>
+          </div>
+        </div>
+
+        <fieldset>
+          <legend>参与循环的形象</legend>
+          <div id="petList" class="pet-list"></div>
+        </fieldset>
+      </section>
+
+      <footer class="actions">
+        <button id="cancelButton" class="secondary" type="button">关闭</button>
+        <button id="saveButton" class="primary" type="button">保存设置</button>
+      </footer>
+    </main>
+
+    <script src="./settings.js"></script>
+  </body>
+</html>
