@@ -21,9 +21,16 @@ PetCreater 是一个独立运行的桌面宠物应用。当前版本只支持安
 - 右键菜单可打开桌宠设置页面。
 - 设置页面支持滑动调整形象大小。
 - 支持多选已安装形象自动循环，可自定义秒、分钟或小时级切换间隔。
+- 支持扩展动作素材，新动作可以放在独立文件中，不破坏老版 `spritesheet.webp`。
+- 新动作缺失时会自动使用语义相近的旧动作兜底，老素材仍可正常使用。
 - 鼠标交互动画：
   - 单击：默认播放 `waving`
   - 双击：默认播放 `jumping`
+  - 长按：优先播放 `long-press`，没有则兜底到 `review`
+  - 点击头部区域：优先播放 `pet-head`
+  - 点击身体区域：优先播放 `pet-body`
+  - 点击脚部区域：优先播放 `pet-feet`
+  - 短时间连续点击：优先播放 `surprised`
   - 右键：只打开菜单，不播放动作
   - 滚轮向上：默认播放 `jumping`
   - 滚轮向下：默认播放 `failed`
@@ -33,7 +40,16 @@ PetCreater 是一个独立运行的桌面宠物应用。当前版本只支持安
   - 拖动开始：默认播放 `running`
   - 向右拖动：默认播放 `running-right`
   - 向左拖动：默认播放 `running-left`
-  - 拖动结束：如果鼠标仍停在桌宠上，回到 `review`；鼠标离开后再循环两次 `waiting`
+  - 拖动落地：优先播放 `landing`，没有则兜底到 `jumping`
+- 本地行为事件：
+  - 用户长时间无操作：优先播放 `sleeping`
+  - 锁屏/休眠：优先播放 `sleeping`
+  - 解锁/恢复：优先播放 `waving`
+  - 早晨时段：优先播放 `waving`
+  - 深夜时段：优先播放 `sleepy`
+  - 电量较低：优先播放 `tired`
+  - 接入电源：优先播放 `waving`
+  - 电量充满：优先播放 `celebrating`
 - 如果导入的图片不是标准图集，应用会把它当作单张形象完整显示，不再强制裁剪成 `192x208` 的半身。但这种模式没有逐帧动画，只会保留点击、双击、拖动的缩放/跳动反馈。
 
 ## 素材格式
@@ -101,6 +117,55 @@ my-pet/
   }
 }
 ```
+
+## 扩展动作素材
+
+老素材可以只保留：
+
+```text
+my-pet/
+  pet.json
+  spritesheet.webp
+```
+
+新素材可以增加任意动作文件：
+
+```text
+my-pet/
+  pet.json
+  spritesheet.webp
+  actions/
+    sleeping.webp
+    landing.webp
+    surprised.webp
+```
+
+`pet.json` 示例：
+
+```json
+{
+  "schemaVersion": 2,
+  "id": "my-pet",
+  "displayName": "我的桌宠",
+  "spritesheetPath": "spritesheet.webp",
+  "cellWidth": 192,
+  "cellHeight": 208,
+  "states": {
+    "idle": { "source": "spritesheet.webp", "row": 0, "frames": 6, "fps": 3, "loop": true },
+    "waving": { "source": "spritesheet.webp", "row": 3, "frames": 6, "fps": 8, "loop": false, "next": "idle" },
+    "sleeping": { "source": "actions/sleeping.webp", "row": 0, "frames": 8, "fps": 4, "loop": true },
+    "landing": { "source": "actions/landing.webp", "row": 0, "frames": 6, "fps": 10, "loop": false, "next": "idle" },
+    "surprised": { "source": "actions/surprised.webp", "row": 0, "frames": 6, "fps": 10, "loop": false, "next": "idle" }
+  },
+  "actionFallbacks": {
+    "sleeping": ["sleeping", "waiting", "idle"],
+    "landing": ["landing", "jumping", "waiting", "idle"],
+    "surprised": ["surprised", "jumping", "failed", "idle"]
+  }
+}
+```
+
+安装时会复制 `spritesheetPath` 和所有 `states[*].source` 引用的文件。运行时会先播放新动作；如果素材没有该动作，会按 `actionFallbacks` 或内置兜底链降级到旧动作，最终回到 `idle`。
 
 ## 开发运行
 

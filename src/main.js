@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain, powerMonitor, shell } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
@@ -7,6 +7,8 @@ let mainWindow = null;
 let settingsWindow = null;
 let dragSession = null;
 let petCycleTimer = null;
+let systemBehaviorTimer = null;
+let wasSystemIdle = false;
 
 const BASE_WINDOW_WIDTH = 260;
 const BASE_WINDOW_HEIGHT = 310;
@@ -15,6 +17,8 @@ const MAX_PET_SCALE = 1.8;
 const DEFAULT_CYCLE_INTERVAL_SECONDS = 60;
 const MIN_CYCLE_INTERVAL_SECONDS = 10;
 const MAX_CYCLE_INTERVAL_SECONDS = 86400;
+const SYSTEM_IDLE_EVENT_SECONDS = 5 * 60;
+const SYSTEM_BEHAVIOR_POLL_MS = 30000;
 
 const DEFAULT_STATES = {
   idle: { row: 0, frames: 6, fps: 3, loop: true },
@@ -34,10 +38,49 @@ const DEFAULT_INTERACTIONS = {
   wheelUp: 'jumping',
   wheelDown: 'failed',
   hover: 'review',
+  longPress: 'long-press',
+  clickHead: 'pet-head',
+  clickBody: 'pet-body',
+  clickFeet: 'pet-feet',
+  clickBurst: 'surprised',
   dragStart: 'running',
   draggingRight: 'running-right',
   draggingLeft: 'running-left',
-  dragEnd: 'idle'
+  dragEnd: 'idle',
+  dragLand: 'landing',
+  userIdle: 'sleeping',
+  screenLocked: 'sleeping',
+  screenUnlocked: 'waving',
+  morning: 'waving',
+  lateNight: 'sleepy',
+  batteryLow: 'tired',
+  batteryCharging: 'waving',
+  batteryFull: 'celebrating'
+};
+
+const DEFAULT_ACTION_FALLBACKS = {
+  'long-press': ['long-press', 'pet-head', 'review', 'waiting', 'idle'],
+  'pet-head': ['pet-head', 'waving', 'review', 'idle'],
+  'pet-body': ['pet-body', 'waving', 'idle'],
+  'pet-feet': ['pet-feet', 'jumping', 'idle'],
+  surprised: ['surprised', 'jumping', 'failed', 'idle'],
+  landing: ['landing', 'jumping', 'waiting', 'idle'],
+  sleeping: ['sleeping', 'waiting', 'idle'],
+  sleepy: ['sleepy', 'sleeping', 'waiting', 'idle'],
+  tired: ['tired', 'failed', 'waiting', 'idle'],
+  celebrating: ['celebrating', 'waving', 'jumping', 'idle'],
+  drinking: ['drinking', 'waving', 'idle'],
+  eating: ['eating', 'waving', 'idle'],
+  thinking: ['thinking', 'review', 'waiting', 'idle'],
+  idle: ['idle'],
+  waving: ['waving', 'idle'],
+  jumping: ['jumping', 'idle'],
+  failed: ['failed', 'waiting', 'idle'],
+  waiting: ['waiting', 'idle'],
+  review: ['review', 'waiting', 'idle'],
+  running: ['running', 'idle'],
+  'running-right': ['running-right', 'running', 'idle'],
+  'running-left': ['running-left', 'running', 'idle']
 };
 
 function userDataPath(...parts) {
@@ -63,6 +106,11 @@ function readJson(file) {
 function writeJson(file, data) {
   ensureDir(path.dirname(file));
   fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function isPathInside(childPath, parentPath) {
+  const relativePath = path.relative(path.resolve(parentPath), path.resolve(childPath));
+  return relativePath === '' || (!relativePath.startsWith('..') && !path.isAbsolute(relativePath));
 }
 
 function sanitizeId(value) {
@@ -200,21 +248,80 @@ function normalizeInteractions(rawInteractions = {}) {
   return interactions;
 }
 
+function normalizeActionFallbacks(rawFallbacks = {}) {
+  const fallbacks = { ...DEFAULT_ACTION_FALLBACKS };
+  for (const [action, chain] of Object.entries(rawFallbacks || {})) {
+    if (Array.isArray(chain) && chain.length) {
+      fallbacks[action] = [...new Set([...chain, 'idle'])];
+    }
+  }
+  return fallbacks;
+}
+
+function normalizeStateSources(states, spritesheetPath) {
+  const normalizedStates = {};
+  for (const [name, state] of Object.entries(states || {})) {
+    normalizedStates[name] = {
+      ...state,
+      source: state.source || spritesheetPath
+    };
+  }
+  return normalizedStates;
+}
+
+function collectPetSources(rawPet, spritesheetPath) {
+  const sources = new Set([spritesheetPath]);
+  for (const state of Object.values(rawPet.states || {})) {
+    if (state && state.source) {
+      sources.add(state.source);
+    }
+  }
+  return [...sources];
+}
+
+function copyRelativeFile(sourceDir, targetDir, relativePath) {
+  const sourceFile = path.resolve(sourceDir, relativePath);
+  const targetFile = path.resolve(targetDir, relativePath);
+  if (!isPathInside(sourceFile, sourceDir)) {
+    throw new Error(`素材路径不允许跳出素材目录：${relativePath}`);
+  }
+  if (!fs.existsSync(sourceFile)) {
+    throw new Error(`所选文件夹缺少素材文件：${relativePath}`);
+  }
+
+  ensureDir(path.dirname(targetFile));
+  fs.copyFileSync(sourceFile, targetFile);
+}
+
 function normalizePet(rawPet, installedDir) {
   const spritesheetPath = rawPet.spritesheetPath || 'spritesheet.webp';
   const spritesheetAbsolutePath = path.resolve(installedDir, spritesheetPath);
+  const states = normalizeStateSources(normalizeStates(rawPet.states), spritesheetPath);
+  const sources = {};
+  for (const sourcePath of collectPetSources({ states }, spritesheetPath)) {
+    const absolutePath = path.resolve(installedDir, sourcePath);
+    sources[sourcePath] = {
+      path: sourcePath,
+      absolutePath,
+      url: pathToFileURL(absolutePath).toString()
+    };
+  }
 
   return {
     id: sanitizeId(rawPet.id),
     displayName: rawPet.displayName || rawPet.name || rawPet.id || 'Custom Pet',
     description: rawPet.description || '',
+    schemaVersion: Number(rawPet.schemaVersion || 1),
+    installedDir,
     spritesheetPath,
     spritesheetAbsolutePath,
     spritesheetUrl: pathToFileURL(spritesheetAbsolutePath).toString(),
+    sources,
     cellWidth: Number(rawPet.cellWidth || 192),
     cellHeight: Number(rawPet.cellHeight || 208),
-    states: normalizeStates(rawPet.states),
-    interactions: normalizeInteractions(rawPet.interactions)
+    states,
+    interactions: normalizeInteractions(rawPet.interactions),
+    actionFallbacks: normalizeActionFallbacks(rawPet.actionFallbacks)
   };
 }
 
@@ -300,32 +407,42 @@ function validateSourcePetDir(sourceDir) {
   const rawPet = readJson(manifestPath);
   const petId = sanitizeId(rawPet.id || path.basename(sourceDir));
   const spritesheetPath = rawPet.spritesheetPath || 'spritesheet.webp';
-  const spritesheetSource = path.resolve(sourceDir, spritesheetPath);
+  const sourcePaths = collectPetSources(rawPet, spritesheetPath);
 
-  if (!fs.existsSync(spritesheetSource)) {
-    throw new Error(`所选文件夹缺少素材文件：${spritesheetPath}`);
+  for (const sourcePath of sourcePaths) {
+    const sourceFile = path.resolve(sourceDir, sourcePath);
+    if (!isPathInside(sourceFile, sourceDir)) {
+      throw new Error(`素材路径不允许跳出素材目录：${sourcePath}`);
+    }
+    if (!fs.existsSync(sourceFile)) {
+      throw new Error(`所选文件夹缺少素材文件：${sourcePath}`);
+    }
   }
 
-  return { rawPet, petId, spritesheetSource };
+  return { rawPet, petId, spritesheetPath, sourcePaths };
 }
 
 function installPet(sourceDir) {
-  const { rawPet, petId, spritesheetSource } = validateSourcePetDir(sourceDir);
+  const { rawPet, petId, spritesheetPath, sourcePaths } = validateSourcePetDir(sourceDir);
   const targetDir = path.join(petsRoot(), petId);
-  const spritesheetName = path.basename(spritesheetSource);
 
   ensureDir(targetDir);
-  fs.copyFileSync(spritesheetSource, path.join(targetDir, spritesheetName));
+  for (const sourcePath of sourcePaths) {
+    copyRelativeFile(sourceDir, targetDir, sourcePath);
+  }
 
+  const states = normalizeStateSources(normalizeStates(rawPet.states), spritesheetPath);
   const installedPet = {
     ...rawPet,
     id: petId,
+    schemaVersion: Number(rawPet.schemaVersion || 1),
     displayName: rawPet.displayName || rawPet.name || petId,
-    spritesheetPath: spritesheetName,
+    spritesheetPath,
     cellWidth: Number(rawPet.cellWidth || 192),
     cellHeight: Number(rawPet.cellHeight || 208),
-    states: normalizeStates(rawPet.states),
-    interactions: normalizeInteractions(rawPet.interactions)
+    states,
+    interactions: normalizeInteractions(rawPet.interactions),
+    actionFallbacks: normalizeActionFallbacks(rawPet.actionFallbacks)
   };
 
   writeJson(path.join(targetDir, 'pet.json'), installedPet);
@@ -338,6 +455,28 @@ function broadcastPetChanged() {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('pet:changed', getActivePet());
   }
+}
+
+function broadcastSystemEvent(eventName) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('system:event', eventName);
+  }
+}
+
+function startSystemBehaviorPolling() {
+  clearInterval(systemBehaviorTimer);
+  systemBehaviorTimer = setInterval(() => {
+    const idleSeconds = powerMonitor.getSystemIdleTime();
+    if (idleSeconds >= SYSTEM_IDLE_EVENT_SECONDS && !wasSystemIdle) {
+      wasSystemIdle = true;
+      broadcastSystemEvent('userIdle');
+    }
+
+    if (idleSeconds < 5 && wasSystemIdle) {
+      wasSystemIdle = false;
+      broadcastSystemEvent('screenUnlocked');
+    }
+  }, SYSTEM_BEHAVIOR_POLL_MS);
 }
 
 async function chooseAndInstallPet() {
@@ -544,6 +683,14 @@ app.whenReady().then(() => {
   ensureDir(petsRoot());
   createWindow();
   restartPetCycle();
+  startSystemBehaviorPolling();
+
+  powerMonitor.on('lock-screen', () => broadcastSystemEvent('screenLocked'));
+  powerMonitor.on('unlock-screen', () => broadcastSystemEvent('screenUnlocked'));
+  powerMonitor.on('suspend', () => broadcastSystemEvent('screenLocked'));
+  powerMonitor.on('resume', () => broadcastSystemEvent('screenUnlocked'));
+  powerMonitor.on('on-battery', () => broadcastSystemEvent('batteryLow'));
+  powerMonitor.on('on-ac', () => broadcastSystemEvent('batteryCharging'));
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

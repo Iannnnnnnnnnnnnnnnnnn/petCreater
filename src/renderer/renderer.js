@@ -3,20 +3,25 @@ const context = canvas.getContext('2d');
 
 let pet = null;
 let spritesheet = null;
+let sourceImages = {};
 let renderMode = 'atlas';
 let currentStateName = 'idle';
 let currentFrame = 0;
 let lastFrameAt = 0;
 let animationRequest = null;
 let clickTimer = null;
+let longPressTimer = null;
 let hoverIdleTimer = null;
 let idleSlowTimer = null;
+let behaviorTimer = null;
 let isDragging = false;
 let dragStarted = false;
 let dragStartPoint = null;
+let pointerDownRegion = null;
 let lastDragDirection = null;
 let lastDragScreenX = null;
 let suppressNextClick = false;
+let longPressTriggered = false;
 let isPointerInside = false;
 let waitForLeaveBeforeWaiting = false;
 let waitingLoopsRemaining = 0;
@@ -24,13 +29,23 @@ let currentFpsOverride = null;
 let petScale = 1;
 let frameSequences = {};
 let frameBounds = {};
+let stateRenderModes = {};
 let currentHitSquare = null;
 let isMousePassthrough = false;
+let lastUserActivityAt = Date.now();
+let lastKnownBattery = null;
+let lastTimeEventKey = null;
+let clickHistory = [];
 
 const DEFAULT_CANVAS_WIDTH = 192;
 const DEFAULT_CANVAS_HEIGHT = 208;
 const IDLE_SLOW_DELAY_MS = 8000;
 const FRAME_ALPHA_THRESHOLD = 8;
+const LONG_PRESS_MS = 650;
+const CLICK_BURST_WINDOW_MS = 900;
+const CLICK_BURST_COUNT = 4;
+const BEHAVIOR_POLL_MS = 30000;
+const USER_IDLE_EVENT_MS = 5 * 60 * 1000;
 
 function stateConfig(name) {
   return pet && pet.states && pet.states[name] ? pet.states[name] : null;
@@ -40,13 +55,26 @@ function interactionState(name) {
   return pet && pet.interactions ? pet.interactions[name] : null;
 }
 
-function playState(name, options = {}) {
-  if (!pet || !name || !stateConfig(name)) {
-    name = 'idle';
+function resolveAction(actionName) {
+  if (!pet) {
+    return null;
   }
 
-  if (currentStateName !== name || options.restart) {
-    currentStateName = name;
+  const fallbackChain = pet.actionFallbacks && pet.actionFallbacks[actionName]
+    ? pet.actionFallbacks[actionName]
+    : [actionName, 'idle'];
+
+  return fallbackChain.find((stateName) => stateConfig(stateName)) || 'idle';
+}
+
+function playState(name, options = {}) {
+  const resolvedName = resolveAction(name);
+  if (!resolvedName) {
+    return;
+  }
+
+  if (currentStateName !== resolvedName || options.restart) {
+    currentStateName = resolvedName;
     currentFrame = 0;
     lastFrameAt = 0;
   }
@@ -59,6 +87,15 @@ function playInteraction(name) {
   if (targetState) {
     playState(targetState, { restart: true });
   }
+}
+
+function triggerBehavior(name) {
+  if (!pet || isDragging) {
+    return;
+  }
+
+  markInteraction();
+  playInteraction(name);
 }
 
 function clearIdleSlowTimer() {
@@ -82,9 +119,17 @@ function scheduleIdleSlow(delay = IDLE_SLOW_DELAY_MS) {
 }
 
 function markInteraction() {
+  lastUserActivityAt = Date.now();
   waitForLeaveBeforeWaiting = true;
   waitingLoopsRemaining = 0;
   clearIdleSlowTimer();
+}
+
+function clearLongPressTimer() {
+  if (longPressTimer) {
+    clearTimeout(longPressTimer);
+    longPressTimer = null;
+  }
 }
 
 function startSlowIdle() {
@@ -153,14 +198,29 @@ function drawImageContained(image, targetWidth, targetHeight) {
   context.drawImage(image, x, y, width, height);
 }
 
-function hasAtlasFrames(image, nextPet) {
-  const states = nextPet.states || {};
-  const maxRow = Math.max(...Object.values(states).map((state) => Number(state.row || 0)));
-  const maxFrames = Math.max(...Object.values(states).map((state) => Number(state.frames || 1)));
-  const cellWidth = Number(nextPet.cellWidth || DEFAULT_CANVAS_WIDTH);
-  const cellHeight = Number(nextPet.cellHeight || DEFAULT_CANVAS_HEIGHT);
+function stateCellWidth(state) {
+  return Number(state.cellWidth || pet.cellWidth || DEFAULT_CANVAS_WIDTH);
+}
 
-  return image.naturalWidth >= maxFrames * cellWidth && image.naturalHeight >= (maxRow + 1) * cellHeight;
+function stateCellHeight(state) {
+  return Number(state.cellHeight || pet.cellHeight || DEFAULT_CANVAS_HEIGHT);
+}
+
+function getStateSource(state) {
+  return state.source || pet.spritesheetPath;
+}
+
+function getStateImage(state) {
+  return sourceImages[getStateSource(state)] || spritesheet;
+}
+
+function hasStateFrames(image, state) {
+  const row = Number(state.row || 0);
+  const frames = Number(state.frames || 1);
+  const cellWidth = stateCellWidth(state);
+  const cellHeight = stateCellHeight(state);
+
+  return image.naturalWidth >= frames * cellWidth && image.naturalHeight >= (row + 1) * cellHeight;
 }
 
 function getFrameBounds(image, sourceX, sourceY, cellWidth, cellHeight) {
@@ -210,18 +270,25 @@ function getFrameBounds(image, sourceX, sourceY, cellWidth, cellHeight) {
   };
 }
 
-function buildFrameMetadata(image, nextPet) {
+function buildFrameMetadata(nextPet) {
   const sequences = {};
   const bounds = {};
-  const cellWidth = Number(nextPet.cellWidth || DEFAULT_CANVAS_WIDTH);
-  const cellHeight = Number(nextPet.cellHeight || DEFAULT_CANVAS_HEIGHT);
+  const renderModes = {};
 
   for (const [stateName, state] of Object.entries(nextPet.states || {})) {
+    const image = sourceImages[getStateSource(state)];
+    if (!image) {
+      continue;
+    }
+
     const configuredFrameCount = Number(state.frames || 1);
     const row = Number(state.row || 0);
+    const cellWidth = Number(state.cellWidth || nextPet.cellWidth || DEFAULT_CANVAS_WIDTH);
+    const cellHeight = Number(state.cellHeight || nextPet.cellHeight || DEFAULT_CANVAS_HEIGHT);
     const visibleFrames = [];
     const validFrames = [];
     bounds[stateName] = {};
+    renderModes[stateName] = hasStateFrames(image, state) ? 'atlas' : 'single-image';
 
     for (let frame = 0; frame < configuredFrameCount; frame += 1) {
       const sourceX = frame * cellWidth;
@@ -239,7 +306,7 @@ function buildFrameMetadata(image, nextPet) {
     sequences[stateName] = visibleFrames.length ? visibleFrames : validFrames;
   }
 
-  return { sequences, bounds };
+  return { sequences, bounds, renderModes };
 }
 
 function getFrameSequence(stateName, state) {
@@ -294,6 +361,40 @@ function pointInCurrentHitSquare(clientX, clientY) {
   );
 }
 
+function pointToHitSquarePosition(clientX, clientY) {
+  if (!currentHitSquare || canvas.hidden) {
+    return null;
+  }
+
+  const canvasRect = canvas.getBoundingClientRect();
+  const scaleX = canvasRect.width / canvas.width;
+  const scaleY = canvasRect.height / canvas.height;
+  const hitX = canvasRect.left + currentHitSquare.x * scaleX;
+  const hitY = canvasRect.top + currentHitSquare.y * scaleY;
+  const hitWidth = currentHitSquare.width * scaleX;
+  const hitHeight = currentHitSquare.height * scaleY;
+
+  return {
+    x: (clientX - hitX) / hitWidth,
+    y: (clientY - hitY) / hitHeight
+  };
+}
+
+function pointToClickRegion(clientX, clientY) {
+  const position = pointToHitSquarePosition(clientX, clientY);
+  if (!position) {
+    return 'body';
+  }
+
+  if (position.y <= 0.35) {
+    return 'head';
+  }
+  if (position.y >= 0.78) {
+    return 'feet';
+  }
+  return 'body';
+}
+
 function setMousePassthrough(passthrough) {
   if (isMousePassthrough === passthrough) {
     return;
@@ -331,20 +432,25 @@ function updateMousePassthrough(event) {
 
 function renderFrame(now) {
   animationRequest = requestAnimationFrame(renderFrame);
-  if (!pet || !spritesheet || !spritesheet.complete) {
-    return;
-  }
-
-  if (renderMode === 'single-image') {
-    const targetWidth = Math.min(Math.max(spritesheet.naturalWidth, 120), 260);
-    const targetHeight = Math.min(Math.max(spritesheet.naturalHeight, 120), 300);
-    resizeCanvas(targetWidth, targetHeight);
-    currentHitSquare = { x: 0, y: 0, width: targetWidth, height: targetHeight };
-    drawImageContained(spritesheet, targetWidth, targetHeight);
+  if (!pet) {
     return;
   }
 
   const state = stateConfig(currentStateName) || stateConfig('idle');
+  const stateImage = getStateImage(state);
+  if (!stateImage || !stateImage.complete) {
+    return;
+  }
+
+  if (stateRenderModes[currentStateName] === 'single-image') {
+    const targetWidth = Math.min(Math.max(stateImage.naturalWidth, 120), 260);
+    const targetHeight = Math.min(Math.max(stateImage.naturalHeight, 120), 300);
+    resizeCanvas(targetWidth, targetHeight);
+    currentHitSquare = { x: 0, y: 0, width: targetWidth, height: targetHeight };
+    drawImageContained(stateImage, targetWidth, targetHeight);
+    return;
+  }
+
   const fps = Number(currentFpsOverride || state.fps || 6);
   const frameDuration = 1000 / fps;
   const frameCount = getEffectiveFrameCount(currentStateName, state);
@@ -373,8 +479,8 @@ function renderFrame(now) {
   }
 
   const activeState = stateConfig(currentStateName) || state;
-  const cellWidth = Number(pet.cellWidth || 192);
-  const cellHeight = Number(pet.cellHeight || 208);
+  const cellWidth = stateCellWidth(activeState);
+  const cellHeight = stateCellHeight(activeState);
   const frameSequence = getFrameSequence(currentStateName, activeState);
   const sourceFrame = frameSequence[currentFrame] ?? 0;
   const sourceX = sourceFrame * cellWidth;
@@ -384,7 +490,7 @@ function renderFrame(now) {
   currentHitSquare = getHitSquareForFrame(currentStateName, sourceFrame, cellWidth, cellHeight);
   clearCanvas();
   context.drawImage(
-    spritesheet,
+    stateImage,
     sourceX,
     sourceY,
     cellWidth,
@@ -396,20 +502,35 @@ function renderFrame(now) {
   );
 }
 
-function loadSpritesheet(nextPet) {
+function loadImage(url) {
   return new Promise((resolve, reject) => {
     const image = new Image();
     image.onload = () => resolve(image);
     image.onerror = () => reject(new Error('素材图片加载失败'));
-    image.src = nextPet.spritesheetUrl;
+    image.src = url;
   });
+}
+
+async function loadPetSources(nextPet) {
+  const images = {};
+  const entries = Object.entries(nextPet.sources || {
+    [nextPet.spritesheetPath]: { url: nextPet.spritesheetUrl }
+  });
+
+  await Promise.all(entries.map(async ([sourcePath, source]) => {
+    images[sourcePath] = await loadImage(source.url);
+  }));
+
+  return images;
 }
 
 async function setPet(nextPet) {
   pet = nextPet;
   spritesheet = null;
+  sourceImages = {};
   frameSequences = {};
   frameBounds = {};
+  stateRenderModes = {};
   currentHitSquare = null;
   setMousePassthrough(false);
   renderMode = 'atlas';
@@ -419,6 +540,8 @@ async function setPet(nextPet) {
   waitForLeaveBeforeWaiting = false;
   waitingLoopsRemaining = 0;
   clearIdleSlowTimer();
+  clearLongPressTimer();
+  clickHistory = [];
   clearCanvas();
 
   if (!pet) {
@@ -430,13 +553,13 @@ async function setPet(nextPet) {
   canvas.hidden = false;
 
   try {
-    spritesheet = await loadSpritesheet(pet);
-    renderMode = hasAtlasFrames(spritesheet, pet) ? 'atlas' : 'single-image';
-    if (renderMode === 'atlas') {
-      const metadata = buildFrameMetadata(spritesheet, pet);
-      frameSequences = metadata.sequences;
-      frameBounds = metadata.bounds;
-    }
+    sourceImages = await loadPetSources(pet);
+    spritesheet = sourceImages[pet.spritesheetPath];
+    const metadata = buildFrameMetadata(pet);
+    frameSequences = metadata.sequences;
+    frameBounds = metadata.bounds;
+    stateRenderModes = metadata.renderModes;
+    renderMode = stateRenderModes.idle || 'atlas';
     playState('idle', { restart: true });
     scheduleIdleSlow();
   } catch (error) {
@@ -459,9 +582,19 @@ function handlePointerDown(event) {
   };
   dragStarted = false;
   isDragging = true;
+  longPressTriggered = false;
+  pointerDownRegion = pointToClickRegion(event.clientX, event.clientY);
   lastDragDirection = null;
   lastDragScreenX = event.screenX;
   markInteraction();
+  longPressTimer = setTimeout(() => {
+    if (!dragStarted && isDragging) {
+      longPressTriggered = true;
+      suppressNextClick = true;
+      pulseClass('double-tap', 260);
+      playInteraction('longPress');
+    }
+  }, LONG_PRESS_MS);
   canvas.setPointerCapture && canvas.setPointerCapture(event.pointerId);
 }
 
@@ -477,6 +610,7 @@ function handlePointerMove(event) {
   if (!dragStarted && distance >= 6) {
     dragStarted = true;
     suppressNextClick = true;
+    clearLongPressTimer();
     canvas.classList.add('dragging');
     window.petApi.dragStart(dragStartPoint);
     playInteraction('dragStart');
@@ -508,39 +642,54 @@ function handlePointerMove(event) {
 }
 
 function handlePointerUp() {
+  clearLongPressTimer();
   if (dragStarted) {
     window.petApi.dragEnd();
     pulseClass('drop', 180);
-    if (isPointerInside) {
-      playInteraction('hover');
-    } else {
-      startWaitingWindDown(2);
-    }
+    playInteraction('dragLand');
   }
 
   isDragging = false;
   dragStarted = false;
   dragStartPoint = null;
+  pointerDownRegion = null;
   lastDragDirection = null;
   lastDragScreenX = null;
   canvas.classList.remove('dragging');
 }
 
-function handleClick() {
+function handleClick(event) {
   if (!isPointerInside) {
     return;
   }
 
   if (suppressNextClick) {
     suppressNextClick = false;
+    longPressTriggered = false;
     return;
   }
 
   clearTimeout(clickTimer);
   clickTimer = setTimeout(() => {
     markInteraction();
+    const now = Date.now();
+    clickHistory = [...clickHistory.filter((time) => now - time <= CLICK_BURST_WINDOW_MS), now];
     pulseClass('tap', 160);
-    playInteraction('click');
+
+    if (clickHistory.length >= CLICK_BURST_COUNT) {
+      clickHistory = [];
+      playInteraction('clickBurst');
+      return;
+    }
+
+    const region = pointerDownRegion || pointToClickRegion(event.clientX, event.clientY);
+    if (region === 'head') {
+      playInteraction('clickHead');
+    } else if (region === 'feet') {
+      playInteraction('clickFeet');
+    } else {
+      playInteraction('clickBody');
+    }
   }, 220);
 }
 
@@ -581,6 +730,86 @@ function handleWheel(event) {
   playInteraction('wheelDown');
 }
 
+function checkTimeBehavior(now = new Date()) {
+  const hour = now.getHours();
+  let eventName = null;
+  if (hour >= 23 || hour < 6) {
+    eventName = 'lateNight';
+  } else if (hour >= 6 && hour < 9) {
+    eventName = 'morning';
+  }
+
+  if (!eventName) {
+    return;
+  }
+
+  const eventKey = `${eventName}-${now.toDateString()}`;
+  if (eventKey === lastTimeEventKey) {
+    return;
+  }
+
+  lastTimeEventKey = eventKey;
+  triggerBehavior(eventName);
+}
+
+async function checkBatteryBehavior() {
+  if (!navigator.getBattery) {
+    return;
+  }
+
+  const battery = await navigator.getBattery();
+  const level = Math.round(battery.level * 100);
+  const nextBattery = {
+    charging: battery.charging,
+    low: !battery.charging && level <= 20,
+    full: battery.charging && level >= 95
+  };
+
+  if (!lastKnownBattery) {
+    lastKnownBattery = nextBattery;
+    return;
+  }
+
+  if (nextBattery.low && !lastKnownBattery.low) {
+    triggerBehavior('batteryLow');
+  } else if (nextBattery.full && !lastKnownBattery.full) {
+    triggerBehavior('batteryFull');
+  } else if (nextBattery.charging && !lastKnownBattery.charging) {
+    triggerBehavior('batteryCharging');
+  }
+
+  lastKnownBattery = nextBattery;
+}
+
+function checkIdleBehavior() {
+  if (Date.now() - lastUserActivityAt >= USER_IDLE_EVENT_MS && !isPointerInside && !isDragging) {
+    triggerBehavior('userIdle');
+    lastUserActivityAt = Date.now();
+  }
+}
+
+function startBehaviorPolling() {
+  clearInterval(behaviorTimer);
+  behaviorTimer = setInterval(() => {
+    checkIdleBehavior();
+    checkTimeBehavior();
+    checkBatteryBehavior().catch((error) => console.error(error));
+  }, BEHAVIOR_POLL_MS);
+}
+
+function handleVisibilityChange() {
+  if (document.hidden) {
+    triggerBehavior('screenLocked');
+    return;
+  }
+
+  triggerBehavior('screenUnlocked');
+}
+
+function handleSystemEvent(eventName) {
+  triggerBehavior(eventName);
+}
+
 async function boot() {
   canvas.addEventListener('pointerdown', handlePointerDown);
   window.addEventListener('pointermove', handlePointerMove);
@@ -591,6 +820,7 @@ async function boot() {
   canvas.addEventListener('dblclick', handleDoubleClick);
   window.addEventListener('contextmenu', handleContextMenu);
   window.addEventListener('wheel', handleWheel, { passive: false });
+  document.addEventListener('visibilitychange', handleVisibilityChange);
 
   window.petApi.onPetChanged((changedPet) => {
     setPet(changedPet).catch((error) => {
@@ -602,6 +832,7 @@ async function boot() {
   window.petApi.onScaleChanged((scale) => {
     petScale = scale;
   });
+  window.petApi.onSystemEvent(handleSystemEvent);
 
   const activePet = await window.petApi.getActivePet();
   await setPet(activePet);
@@ -615,6 +846,7 @@ async function boot() {
   if (!animationRequest) {
     animationRequest = requestAnimationFrame(renderFrame);
   }
+  startBehaviorPolling();
 }
 
 boot().catch((error) => {

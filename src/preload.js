@@ -20,5 +20,8 @@ contextBridge.exposeInMainWorld('petApi', {
   },
   onScaleChanged: (callback) => {
     ipcRenderer.on('view:scale-changed', (_event, scale) => callback(scale));
+  },
+  onSystemEvent: (callback) => {
+    ipcRenderer.on('system:event', (_event, eventName) => callback(eventName));
   }
 });
