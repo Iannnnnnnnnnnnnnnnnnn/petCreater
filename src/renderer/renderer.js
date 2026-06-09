@@ -10,18 +10,15 @@ let currentFrame = 0;
 let lastFrameAt = 0;
 let animationRequest = null;
 let clickTimer = null;
-let longPressTimer = null;
 let hoverIdleTimer = null;
 let idleSlowTimer = null;
 let behaviorTimer = null;
 let isDragging = false;
 let dragStarted = false;
 let dragStartPoint = null;
-let pointerDownRegion = null;
 let lastDragDirection = null;
 let lastDragScreenX = null;
 let suppressNextClick = false;
-let longPressTriggered = false;
 let isPointerInside = false;
 let waitForLeaveBeforeWaiting = false;
 let waitingLoopsRemaining = 0;
@@ -34,18 +31,19 @@ let currentHitSquare = null;
 let isMousePassthrough = false;
 let lastUserActivityAt = Date.now();
 let lastKnownBattery = null;
-let lastTimeEventKey = null;
 let clickHistory = [];
+let isScreenInactive = document.hidden;
+let forceBatteryTired = false;
 
 const DEFAULT_CANVAS_WIDTH = 192;
 const DEFAULT_CANVAS_HEIGHT = 208;
 const IDLE_SLOW_DELAY_MS = 8000;
 const FRAME_ALPHA_THRESHOLD = 8;
-const LONG_PRESS_MS = 650;
 const CLICK_BURST_WINDOW_MS = 900;
-const CLICK_BURST_COUNT = 4;
+const TRIPLE_CLICK_COUNT = 3;
 const BEHAVIOR_POLL_MS = 30000;
 const USER_IDLE_EVENT_MS = 5 * 60 * 1000;
+const PASSIVE_STATES = new Set(['tired', 'sleeping', 'sleepy']);
 
 function stateConfig(name) {
   return pet && pet.states && pet.states[name] ? pet.states[name] : null;
@@ -89,13 +87,47 @@ function playInteraction(name) {
   }
 }
 
-function triggerBehavior(name) {
+function isLateNight(now = new Date()) {
+  const hour = now.getHours();
+  return hour >= 23 || hour < 6;
+}
+
+function isUserInactive() {
+  return Date.now() - lastUserActivityAt >= USER_IDLE_EVENT_MS && !isDragging;
+}
+
+function resolvePassiveState(now = new Date()) {
+  if (!isScreenInactive && !isUserInactive()) {
+    return 'idle';
+  }
+  if (forceBatteryTired || (lastKnownBattery && lastKnownBattery.low)) {
+    return 'tired';
+  }
+  if (isScreenInactive) {
+    return 'sleeping';
+  }
+  if (isUserInactive() && isLateNight(now)) {
+    return 'sleepy';
+  }
+  return 'idle';
+}
+
+function applyPassiveState(options = {}) {
   if (!pet || isDragging) {
     return;
   }
 
-  markInteraction();
-  playInteraction(name);
+  const nextState = resolvePassiveState();
+  if (nextState === 'idle') {
+    if (PASSIVE_STATES.has(currentStateName) || options.force) {
+      playState('idle', { restart: currentStateName !== 'idle' });
+    }
+    return;
+  }
+
+  if (currentStateName !== nextState || options.force) {
+    playState(nextState, { restart: true });
+  }
 }
 
 function clearIdleSlowTimer() {
@@ -123,12 +155,8 @@ function markInteraction() {
   waitForLeaveBeforeWaiting = true;
   waitingLoopsRemaining = 0;
   clearIdleSlowTimer();
-}
-
-function clearLongPressTimer() {
-  if (longPressTimer) {
-    clearTimeout(longPressTimer);
-    longPressTimer = null;
+  if (PASSIVE_STATES.has(currentStateName)) {
+    playState('idle', { restart: true });
   }
 }
 
@@ -380,21 +408,6 @@ function pointToHitSquarePosition(clientX, clientY) {
   };
 }
 
-function pointToClickRegion(clientX, clientY) {
-  const position = pointToHitSquarePosition(clientX, clientY);
-  if (!position) {
-    return 'body';
-  }
-
-  if (position.y <= 0.35) {
-    return 'head';
-  }
-  if (position.y >= 0.78) {
-    return 'feet';
-  }
-  return 'body';
-}
-
 function setMousePassthrough(passthrough) {
   if (isMousePassthrough === passthrough) {
     return;
@@ -540,7 +553,6 @@ async function setPet(nextPet) {
   waitForLeaveBeforeWaiting = false;
   waitingLoopsRemaining = 0;
   clearIdleSlowTimer();
-  clearLongPressTimer();
   clickHistory = [];
   clearCanvas();
 
@@ -582,19 +594,9 @@ function handlePointerDown(event) {
   };
   dragStarted = false;
   isDragging = true;
-  longPressTriggered = false;
-  pointerDownRegion = pointToClickRegion(event.clientX, event.clientY);
   lastDragDirection = null;
   lastDragScreenX = event.screenX;
   markInteraction();
-  longPressTimer = setTimeout(() => {
-    if (!dragStarted && isDragging) {
-      longPressTriggered = true;
-      suppressNextClick = true;
-      pulseClass('double-tap', 260);
-      playInteraction('longPress');
-    }
-  }, LONG_PRESS_MS);
   canvas.setPointerCapture && canvas.setPointerCapture(event.pointerId);
 }
 
@@ -610,7 +612,6 @@ function handlePointerMove(event) {
   if (!dragStarted && distance >= 6) {
     dragStarted = true;
     suppressNextClick = true;
-    clearLongPressTimer();
     canvas.classList.add('dragging');
     window.petApi.dragStart(dragStartPoint);
     playInteraction('dragStart');
@@ -642,17 +643,15 @@ function handlePointerMove(event) {
 }
 
 function handlePointerUp() {
-  clearLongPressTimer();
   if (dragStarted) {
     window.petApi.dragEnd();
     pulseClass('drop', 180);
-    playInteraction('dragLand');
+    playInteraction('dragEnd');
   }
 
   isDragging = false;
   dragStarted = false;
   dragStartPoint = null;
-  pointerDownRegion = null;
   lastDragDirection = null;
   lastDragScreenX = null;
   canvas.classList.remove('dragging');
@@ -665,43 +664,33 @@ function handleClick(event) {
 
   if (suppressNextClick) {
     suppressNextClick = false;
-    longPressTriggered = false;
+    return;
+  }
+
+  markInteraction();
+  const now = Date.now();
+  clickHistory = [...clickHistory.filter((time) => now - time <= CLICK_BURST_WINDOW_MS), now];
+
+  if (clickHistory.length >= TRIPLE_CLICK_COUNT) {
+    clearTimeout(clickTimer);
+    clickHistory = [];
+    pulseClass('double-tap', 260);
+    playInteraction('tripleClick');
     return;
   }
 
   clearTimeout(clickTimer);
   clickTimer = setTimeout(() => {
-    markInteraction();
-    const now = Date.now();
-    clickHistory = [...clickHistory.filter((time) => now - time <= CLICK_BURST_WINDOW_MS), now];
-    pulseClass('tap', 160);
-
-    if (clickHistory.length >= CLICK_BURST_COUNT) {
-      clickHistory = [];
-      playInteraction('clickBurst');
+    const clickCount = clickHistory.length;
+    clickHistory = [];
+    if (clickCount >= 2) {
+      pulseClass('double-tap', 260);
+      playInteraction('doubleClick');
       return;
     }
-
-    const region = pointerDownRegion || pointToClickRegion(event.clientX, event.clientY);
-    if (region === 'head') {
-      playInteraction('clickHead');
-    } else if (region === 'feet') {
-      playInteraction('clickFeet');
-    } else {
-      playInteraction('clickBody');
-    }
-  }, 220);
-}
-
-function handleDoubleClick() {
-  if (!isPointerInside) {
-    return;
-  }
-
-  clearTimeout(clickTimer);
-  markInteraction();
-  pulseClass('double-tap', 260);
-  playInteraction('doubleClick');
+    pulseClass('tap', 160);
+    playInteraction('click');
+  }, CLICK_BURST_WINDOW_MS);
 }
 
 function handleContextMenu(event) {
@@ -731,29 +720,12 @@ function handleWheel(event) {
 }
 
 function checkTimeBehavior(now = new Date()) {
-  const hour = now.getHours();
-  let eventName = null;
-  if (hour >= 23 || hour < 6) {
-    eventName = 'lateNight';
-  } else if (hour >= 6 && hour < 9) {
-    eventName = 'morning';
-  }
-
-  if (!eventName) {
-    return;
-  }
-
-  const eventKey = `${eventName}-${now.toDateString()}`;
-  if (eventKey === lastTimeEventKey) {
-    return;
-  }
-
-  lastTimeEventKey = eventKey;
-  triggerBehavior(eventName);
+  applyPassiveState({ force: isLateNight(now) && isUserInactive() });
 }
 
 async function checkBatteryBehavior() {
   if (!navigator.getBattery) {
+    applyPassiveState();
     return;
   }
 
@@ -765,27 +737,13 @@ async function checkBatteryBehavior() {
     full: battery.charging && level >= 95
   };
 
-  if (!lastKnownBattery) {
-    lastKnownBattery = nextBattery;
-    return;
-  }
-
-  if (nextBattery.low && !lastKnownBattery.low) {
-    triggerBehavior('batteryLow');
-  } else if (nextBattery.full && !lastKnownBattery.full) {
-    triggerBehavior('batteryFull');
-  } else if (nextBattery.charging && !lastKnownBattery.charging) {
-    triggerBehavior('batteryCharging');
-  }
-
   lastKnownBattery = nextBattery;
+  forceBatteryTired = forceBatteryTired && !nextBattery.charging;
+  applyPassiveState({ force: nextBattery.low || nextBattery.full });
 }
 
 function checkIdleBehavior() {
-  if (Date.now() - lastUserActivityAt >= USER_IDLE_EVENT_MS && !isPointerInside && !isDragging) {
-    triggerBehavior('userIdle');
-    lastUserActivityAt = Date.now();
-  }
+  applyPassiveState({ force: isUserInactive() });
 }
 
 function startBehaviorPolling() {
@@ -798,16 +756,25 @@ function startBehaviorPolling() {
 }
 
 function handleVisibilityChange() {
-  if (document.hidden) {
-    triggerBehavior('screenLocked');
-    return;
-  }
-
-  triggerBehavior('screenUnlocked');
+  isScreenInactive = document.hidden;
+  applyPassiveState({ force: true });
 }
 
 function handleSystemEvent(eventName) {
-  triggerBehavior(eventName);
+  if (eventName === 'screenLocked') {
+    isScreenInactive = true;
+  } else if (eventName === 'screenUnlocked') {
+    isScreenInactive = false;
+    lastUserActivityAt = Date.now();
+  } else if (eventName === 'batteryLow') {
+    forceBatteryTired = true;
+  } else if (eventName === 'batteryCharging') {
+    forceBatteryTired = false;
+  } else if (eventName === 'userIdle') {
+    lastUserActivityAt = Date.now() - USER_IDLE_EVENT_MS;
+  }
+
+  applyPassiveState({ force: true });
 }
 
 async function boot() {
@@ -817,7 +784,6 @@ async function boot() {
   window.addEventListener('pointerup', handlePointerUp);
   window.addEventListener('pointercancel', handlePointerUp);
   canvas.addEventListener('click', handleClick);
-  canvas.addEventListener('dblclick', handleDoubleClick);
   window.addEventListener('contextmenu', handleContextMenu);
   window.addEventListener('wheel', handleWheel, { passive: false });
   document.addEventListener('visibilitychange', handleVisibilityChange);

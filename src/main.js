@@ -34,53 +34,47 @@ const DEFAULT_STATES = {
 
 const DEFAULT_INTERACTIONS = {
   click: 'waving',
-  doubleClick: 'jumping',
+  doubleClick: 'surprised',
   wheelUp: 'jumping',
   wheelDown: 'failed',
   hover: 'review',
-  longPress: 'long-press',
-  clickHead: 'pet-head',
-  clickBody: 'pet-body',
-  clickFeet: 'pet-feet',
-  clickBurst: 'surprised',
+  tripleClick: 'celebrating',
   dragStart: 'running',
   draggingRight: 'running-right',
   draggingLeft: 'running-left',
   dragEnd: 'idle',
-  dragLand: 'landing',
-  userIdle: 'sleeping',
+  userIdle: 'idle',
   screenLocked: 'sleeping',
-  screenUnlocked: 'waving',
+  screenUnlocked: 'idle',
   morning: 'waving',
   lateNight: 'sleepy',
   batteryLow: 'tired',
-  batteryCharging: 'waving',
-  batteryFull: 'celebrating'
+  batteryCharging: 'idle',
+  batteryFull: 'idle'
 };
 
 const DEFAULT_ACTION_FALLBACKS = {
-  'long-press': ['long-press', 'pet-head', 'review', 'waiting', 'idle'],
-  'pet-head': ['pet-head', 'waving', 'review', 'idle'],
-  'pet-body': ['pet-body', 'waving', 'idle'],
-  'pet-feet': ['pet-feet', 'jumping', 'idle'],
-  surprised: ['surprised', 'jumping', 'failed', 'idle'],
-  landing: ['landing', 'jumping', 'waiting', 'idle'],
-  sleeping: ['sleeping', 'waiting', 'idle'],
-  sleepy: ['sleepy', 'sleeping', 'waiting', 'idle'],
-  tired: ['tired', 'failed', 'waiting', 'idle'],
-  celebrating: ['celebrating', 'waving', 'jumping', 'idle'],
-  drinking: ['drinking', 'waving', 'idle'],
-  eating: ['eating', 'waving', 'idle'],
-  thinking: ['thinking', 'review', 'waiting', 'idle'],
   idle: ['idle'],
   waving: ['waving', 'idle'],
   jumping: ['jumping', 'idle'],
-  failed: ['failed', 'waiting', 'idle'],
+  failed: ['failed', 'idle'],
   waiting: ['waiting', 'idle'],
-  review: ['review', 'waiting', 'idle'],
+  review: ['review', 'idle'],
   running: ['running', 'idle'],
   'running-right': ['running-right', 'running', 'idle'],
-  'running-left': ['running-left', 'running', 'idle']
+  'running-left': ['running-left', 'running', 'idle'],
+  surprised: ['surprised', 'idle'],
+  sleeping: ['sleeping', 'idle'],
+  sleepy: ['sleepy', 'idle'],
+  tired: ['tired', 'idle'],
+  celebrating: ['celebrating', 'idle']
+};
+
+const ALLOWED_INTERACTION_KEYS = new Set(Object.keys(DEFAULT_INTERACTIONS));
+const ALLOWED_STATE_ACTIONS = new Set(Object.keys(DEFAULT_ACTION_FALLBACKS));
+const FIXED_INTERACTIONS = {
+  userIdle: 'idle',
+  batteryFull: 'idle'
 };
 
 function userDataPath(...parts) {
@@ -238,11 +232,14 @@ function normalizeStates(rawStates = {}) {
 }
 
 function normalizeInteractions(rawInteractions = {}) {
-  const interactions = { ...DEFAULT_INTERACTIONS, ...(rawInteractions || {}) };
-  delete interactions.rightClick;
-
-  if (interactions.wheelDown === 'waving') {
-    interactions.wheelDown = DEFAULT_INTERACTIONS.wheelDown;
+  const interactions = { ...DEFAULT_INTERACTIONS };
+  for (const [name, action] of Object.entries(rawInteractions || {})) {
+    if (ALLOWED_INTERACTION_KEYS.has(name) && ALLOWED_STATE_ACTIONS.has(action)) {
+      interactions[name] = action;
+    }
+  }
+  for (const [name, action] of Object.entries(FIXED_INTERACTIONS)) {
+    interactions[name] = action;
   }
 
   return interactions;
@@ -251,8 +248,10 @@ function normalizeInteractions(rawInteractions = {}) {
 function normalizeActionFallbacks(rawFallbacks = {}) {
   const fallbacks = { ...DEFAULT_ACTION_FALLBACKS };
   for (const [action, chain] of Object.entries(rawFallbacks || {})) {
-    if (Array.isArray(chain) && chain.length) {
-      fallbacks[action] = [...new Set([...chain, 'idle'])];
+    if (Object.prototype.hasOwnProperty.call(fallbacks, action) && Array.isArray(chain) && chain.length) {
+      fallbacks[action] = [...new Set([...chain.filter((state) => (
+        ALLOWED_STATE_ACTIONS.has(state)
+      )), 'idle'])];
     }
   }
   return fallbacks;
