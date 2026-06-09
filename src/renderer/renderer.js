@@ -40,6 +40,9 @@ const DEFAULT_CANVAS_HEIGHT = 208;
 const IDLE_SLOW_DELAY_MS = 8000;
 const FRAME_ALPHA_THRESHOLD = 8;
 const CLICK_BURST_WINDOW_MS = 900;
+const SINGLE_CLICK_RESOLVE_MS = 360;
+const DOUBLE_CLICK_RESOLVE_MS = 260;
+const SINGLE_CLICK_FPS_OVERRIDE = 4;
 const TRIPLE_CLICK_COUNT = 3;
 const BEHAVIOR_POLL_MS = 30000;
 const USER_IDLE_EVENT_MS = 5 * 60 * 1000;
@@ -80,10 +83,10 @@ function playState(name, options = {}) {
   currentFpsOverride = options.fpsOverride || null;
 }
 
-function playInteraction(name) {
+function playInteraction(name, options = {}) {
   const targetState = interactionState(name);
   if (targetState) {
-    playState(targetState, { restart: true });
+    playState(targetState, { restart: true, ...options });
   }
 }
 
@@ -680,6 +683,7 @@ function handleClick(event) {
   }
 
   clearTimeout(clickTimer);
+  const resolveDelay = clickHistory.length >= 2 ? DOUBLE_CLICK_RESOLVE_MS : SINGLE_CLICK_RESOLVE_MS;
   clickTimer = setTimeout(() => {
     const clickCount = clickHistory.length;
     clickHistory = [];
@@ -689,8 +693,8 @@ function handleClick(event) {
       return;
     }
     pulseClass('tap', 160);
-    playInteraction('click');
-  }, CLICK_BURST_WINDOW_MS);
+    playInteraction('click', { fpsOverride: SINGLE_CLICK_FPS_OVERRIDE });
+  }, resolveDelay);
 }
 
 function handleContextMenu(event) {
